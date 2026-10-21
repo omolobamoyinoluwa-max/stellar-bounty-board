@@ -75,7 +75,6 @@ import {
 import { idempotencyMiddleware } from './middleware/idempotency';
 import { requireJsonContentType } from './middleware/contentType';
 import { enforceBodyLimit, DEFAULT_BODY_LIMIT } from './middleware/bodyLimit';
-import { readLimiter, mutationLimiter } from './utils';
 import { maintainerLimiter } from './middleware/maintainerLimiter';
 import { logger } from './logger';
 import rateLimit from 'express-rate-limit';
@@ -148,7 +147,7 @@ const readLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many read requests, please slow down.' },
-  keyGenerator: (req: any) => req.ip || req.socket.remoteAddress || 'unknown',
+  skip: () => process.env.NODE_ENV === 'test' && process.env.RATE_LIMIT_TEST_MODE !== 'true',
 });
 
 const mutationLimiter = rateLimit({
@@ -157,7 +156,43 @@ const mutationLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many mutations, please slow down.' },
-  keyGenerator: (req: any) => req.ip || req.socket.remoteAddress || 'unknown',
+  skip: (req: Request) =>
+    (process.env.NODE_ENV === 'test' && process.env.RATE_LIMIT_TEST_MODE !== 'true') ||
+    Boolean(req.path && req.path.endsWith('/release')),
+});
+
+/**
+ * Route-specific explicit rate limiter for POST /api/bounties/:id/release (#1209).
+ *
+ * Cost justification:
+ * Releasing a bounty is a high-cost, critical financial operation that:
+ * 1. Cryptographically verifies maintainer Ed25519 signatures and public key authorization.
+ * 2. Interacts with the Stellar blockchain / Soroban RPC to release or verify escrow disbursement.
+ * 3. Modifies persistent state ('submitted' -> 'released'), writes audit records, and invalidates caches.
+ * 4. Triggers asynchronous push notifications and lifecycle transition webhooks.
+ *
+ * Maintainers execute releases intentionally after milestone or pull request review approval;
+ * legitimate callers do not invoke this endpoint in high-frequency bursts. An explicit ceiling
+ * of 10 requests per minute (configurable via RATE_LIMIT_RELEASE_MAX and RATE_LIMIT_RELEASE_WINDOW_MS)
+ * prevents transaction spam, mitigates replay attacks, and protects downstream RPC infrastructure.
+ *
+ * When the limit is exceeded, HTTP 429 is returned with an explicit Retry-After header.
+ */
+export const releaseLimiter = rateLimit({
+  windowMs: appConfig.rateLimitReleaseWindowMs,
+  max: appConfig.rateLimitReleaseMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => process.env.NODE_ENV === 'test' && process.env.RATE_LIMIT_TEST_MODE !== 'true',
+  handler: (req: Request, res: Response) => {
+    const retryAfter = Math.ceil(appConfig.rateLimitReleaseWindowMs / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    res.status(429).json({
+      error: 'Too many bounty release attempts. Please try again later.',
+      retryAfter,
+      requestId: req.requestId,
+    });
+  },
 });
 
 // Apply read limiter to all GET requests
@@ -979,7 +1014,7 @@ app.post(
 
 app.post(
   '/api/bounties/:id/release',
-  mutationLimiter,
+  releaseLimiter,
   enforceBodyLimit(DEFAULT_BODY_LIMIT),
   requireJsonContentType,
   idempotencyMiddleware,
